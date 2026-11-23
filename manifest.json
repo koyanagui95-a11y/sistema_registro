@@ -1,0 +1,25 @@
+{
+  "name": "Admin · Riego Inteligente",
+  "short_name": "Admin Riego",
+  "description": "Panel de administración para gestión de clientes y dispositivos de Riego Inteligente",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#ffffff",
+  "theme_color": "#0d6efd",
+  "icons": [
+    {
+      "src": "icono-riego-inteligente-admin.png",
+      "sizes": "1024x1024",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icono-riego-inteligente-admin.png",
+      "sizes": "1024x1024",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
