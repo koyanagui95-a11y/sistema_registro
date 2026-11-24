@@ -1,633 +1,568 @@
-const CONFIG = {
-    API_URL: (() => {
-        const host = window.location.hostname;
-        if (host === 'localhost' || host === '127.0.0.1') return 'http://localhost:8080/api';
-        return 'https://riego-back-kzob.onrender.com/api';
-    })(),
-    SESSION_TIMEOUT_MS: 30 * 60 * 1000
-};
-
 (function () {
+    const TIMEOUT_MS = 30 * 60 * 1000;
+    let _timer = null;
+
     const $ = (id) => document.getElementById(id);
-    let inactivityTimer = null;
-    let clientesCache = [];
-    let logoutConfirmado = false;
-    let deferredAdminPrompt = null;
 
-    if ('serviceWorker' in navigator) {
-        window.addEventListener('load', () => {
-            navigator.serviceWorker.register('./sw.js').catch(() => { });
-        });
-    }
-
-    window.addEventListener('beforeinstallprompt', (e) => {
-        e.preventDefault();
-        deferredAdminPrompt = e;
-        const btn = $('btnInstallAdminPwa');
-        if (btn) btn.classList.remove('d-none');
-    });
-
-    if ($('btnInstallAdminPwa')) {
-        $('btnInstallAdminPwa').addEventListener('click', async () => {
-            if (!deferredAdminPrompt) return;
-            deferredAdminPrompt.prompt();
-            await deferredAdminPrompt.userChoice;
-            deferredAdminPrompt = null;
-            $('btnInstallAdminPwa').classList.add('d-none');
-        });
-    }
-
-    window.addEventListener('appinstalled', () => {
-        if ($('btnInstallAdminPwa')) $('btnInstallAdminPwa').classList.add('d-none');
-        deferredAdminPrompt = null;
-    });
-
-    function escapeHtml(val) {
-        return String(val ?? '')
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;');
-    }
-
-    function getToken() { return localStorage.getItem('adminToken'); }
-    function getRol() { return localStorage.getItem('adminRol') || 'PERSONAL'; }
-    function esAdmin() { return getRol() === 'ADMIN'; }
-
-    function notify(message, type = 'info') {
-        const toastEl = $('adminToast');
-        const toastBody = $('adminToastBody');
+    function mostrarNotificacion(mensaje, tipo = 'info') {
+        const toastEl = $('appToast');
+        const toastBody = $('appToastBody');
         if (toastEl && toastBody && window.bootstrap && bootstrap.Toast) {
-            toastEl.className = `toast align-items-center text-bg-${type} border-0 shadow`;
-            toastBody.textContent = message;
+            toastEl.className = `toast align-items-center text-bg-${tipo} border-0 shadow`;
+            toastBody.textContent = mensaje;
             const toast = bootstrap.Toast.getOrCreateInstance(toastEl, { delay: 4000 });
             toast.show();
-            return;
         }
-        if ($('alert')) showAlert('alert', message, type);
-        else if ($('registerAlert')) showAlert('registerAlert', message, type);
     }
 
-    function cerrarSesion(msg) {
-        localStorage.removeItem('adminToken');
-        localStorage.removeItem('adminUsername');
-        localStorage.removeItem('adminRol');
-        localStorage.removeItem('adminLastActivity');
-        if (msg) {
-            sessionStorage.setItem('adminLoginNotice', msg);
-            sessionStorage.setItem('adminLoginNoticeType', 'warning');
-        }
-        window.location.replace('index.html');
+    function cerrarSesionPorInactividad() {
+        localStorage.clear();
+        sessionStorage.setItem('loginNotice', 'Sesión expirada por inactividad.');
+        sessionStorage.setItem('loginNoticeType', 'warning');
+        window.location.replace('login.html');
     }
 
     function resetTimer() {
-        if (!getToken()) return;
-        localStorage.setItem('adminLastActivity', Date.now().toString());
-        clearTimeout(inactivityTimer);
-        inactivityTimer = setTimeout(() => cerrarSesion('Sesión expirada por inactividad.'), CONFIG.SESSION_TIMEOUT_MS);
+        if (!localStorage.getItem('token') || !localStorage.getItem('userId')) return;
+        localStorage.setItem('lastActivity', Date.now().toString());
+        clearTimeout(_timer);
+        _timer = setTimeout(cerrarSesionPorInactividad, TIMEOUT_MS);
     }
 
-    function verificarSesionActiva() {
-        const last = parseInt(localStorage.getItem('adminLastActivity') || '0', 10);
-        if (!getToken() || !last || Date.now() - last > CONFIG.SESSION_TIMEOUT_MS) {
-            cerrarSesion('Sesión expirada. Vuelve a iniciar sesión.');
-            return false;
-        }
-        resetTimer();
-        return true;
+    const token = localStorage.getItem('token');
+    const usuarioId = localStorage.getItem('userId');
+    const username = localStorage.getItem('username');
+    const last = parseInt(localStorage.getItem('lastActivity') || '0', 10);
+
+    if (!token || !usuarioId || !last || Date.now() - last > TIMEOUT_MS) {
+        localStorage.clear();
+        window.location.replace('login.html');
+        return;
     }
 
-    async function apiFetch(path, opts = {}) {
-        const res = await fetch(`${CONFIG.API_URL}${path}`, {
-            ...opts,
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${getToken()}`,
-                ...(opts.headers || {})
-            }
+    resetTimer();
+    ['click', 'keydown', 'mousemove', 'scroll'].forEach(evt =>
+        document.addEventListener(evt, resetTimer, { passive: true })
+    );
+
+    const usuarioActualEl = $('usuario-actual');
+    if (usuarioActualEl) usuarioActualEl.textContent = username || 'Usuario';
+
+    const btnLogout = $('btnLogout');
+    if (btnLogout) {
+        btnLogout.addEventListener('click', () => {
+            clearTimeout(_timer);
+            localStorage.clear();
+            window.location.replace('login.html');
         });
-        if (res.status === 401 || res.status === 403) {
-            let msg = 'Sesión inválida. Vuelve a iniciar sesión.';
-            try {
-                const data = await res.clone().json();
-                if (data && data.mensaje) msg = data.mensaje;
-            } catch (_) { }
-            cerrarSesion(msg);
-            throw new Error(msg);
+    }
+
+    let bombaManual = false;
+    let humedadChart = null;
+    let todasLasLecturas = [];
+    let filtroActual = 'dia';
+    let dispositivoOnline = false;
+    let sensores = [];
+    let tanqueBajo = false;
+
+    function getCampo(obj, path) {
+        if (!obj || !path) return undefined;
+        return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
+    }
+
+    function formatearValor(valor, sensor) {
+        if (valor === undefined || valor === null) return '---';
+
+        if (sensor.tipoValor === 'booleano' && sensor.valores) {
+            const key = String(valor === true ? '1' : valor === false ? '0' : valor);
+            return sensor.valores[key] !== undefined ? sensor.valores[key] : (valor ? 'SÍ' : 'NO');
+        }
+
+        if (sensor.tipoValor === 'numero') {
+            const n = Number(valor);
+            if (isNaN(n)) return '---';
+            return sensor.unidad === 'L/min' ? n.toFixed(2) : (Number.isInteger(n) ? n : n.toFixed(1));
+        }
+
+        return String(valor);
+    }
+
+    async function safeFetch(url, opts = {}) {
+        const currentToken = localStorage.getItem('token');
+        const headers = {
+            'Content-Type': 'application/json',
+            ...(opts.headers || {})
+        };
+        if (currentToken) {
+            headers['Authorization'] = `Bearer ${currentToken}`;
+        }
+
+        const res = await fetch(url, {
+            ...opts,
+            headers
+        });
+        if (res.status === 401) {
+            localStorage.clear();
+            window.location.replace('login.html');
+            throw new Error('Sesión expirada');
         }
         return res;
     }
 
-    function showAlert(elId, message, type = 'danger') {
-        const el = $(elId);
-        if (!el) return;
-        el.className = `alert alert-${type}`;
-        el.textContent = message;
-        el.classList.remove('d-none');
-    }
-
-    function hideAlert(elId) {
-        const el = $(elId);
-        if (el) el.classList.add('d-none');
-    }
-
-    const loginForm = $('loginAdminForm');
-    if (loginForm) {
-        const notice = sessionStorage.getItem('adminLoginNotice');
-        const noticeType = sessionStorage.getItem('adminLoginNoticeType') || 'warning';
-        if (notice) {
-            showAlert('alert', notice, noticeType);
-            sessionStorage.removeItem('adminLoginNotice');
-            sessionStorage.removeItem('adminLoginNoticeType');
+    async function cargarConfiguracion() {
+        try {
+            const res = await safeFetch(`${CONFIG.API_URL}/v1/config/${usuarioId}`);
+            if (res.ok) {
+                const data = await res.json();
+                sensores = data.sensores || [];
+            }
+        } catch (err) {
+            console.error('No se pudo cargar config:', err);
         }
+        renderizarTodo();
+    }
 
-        const toggle = $('togglePass');
-        if (toggle) {
-            toggle.addEventListener('click', () => {
-                const input = $('password');
-                const icon = toggle.querySelector('i');
-                if (!input || !icon) return;
-                const isPass = input.type === 'password';
-                input.type = isPass ? 'text' : 'password';
-                icon.className = isPass ? 'bi bi-eye-slash' : 'bi bi-eye';
+    function renderizarTodo() {
+        renderizarCards();
+        renderizarTablaHeader();
+        if (todasLasLecturas.length > 0) {
+            aplicarFiltroYRenderizar();
+        }
+    }
+
+    function renderizarCards() {
+        const container = $('cards-container');
+        if (!container) return;
+        container.innerHTML = '';
+
+        sensores
+            .filter(s => s.habilitado && s.tipo !== 'bomba')
+            .forEach(s => {
+                const card = document.createElement('div');
+                card.className = 'col-md-3';
+                card.setAttribute('data-sensor', s.tipo);
+                card.innerHTML = `
+                    <div class="card border-0 shadow-sm rounded-4 p-3 text-center h-100">
+                        <h6 class="text-muted fw-semibold mb-2">${s.label.toUpperCase()}</h6>
+                        <h2 class="fw-bold text-${s.color} mb-0">
+                            <span id="val-${s.tipo}">---</span>${s.unidad ? ' <small class="fs-6">' + s.unidad + '</small>' : ''}
+                        </h2>
+                        ${s.tipo === 'suelo' ? '<div class="progress mt-2" style="height: 8px;"><div id="bar-' + s.tipo + '" class="progress-bar bg-' + s.color + '" style="width: 0%"></div></div>' : ''}
+                    </div>
+                `;
+                container.appendChild(card);
             });
+
+        const cardBomba = $('card-control-manual');
+        const sensorBomba = sensores.find(s => s.tipo === 'bomba');
+        if (cardBomba && sensorBomba && sensorBomba.habilitado === false) {
+            cardBomba.classList.add('d-none');
+        } else if (cardBomba) {
+            cardBomba.classList.remove('d-none');
+        }
+    }
+
+    function renderizarTablaHeader() {
+        const thead = $('tabla-header');
+        if (!thead) return;
+
+        let html = '<tr><th>Fecha y Hora</th>';
+        sensores.filter(s => s.habilitado).forEach(s => {
+            html += `<th>${s.label}</th>`;
+        });
+        html += '</tr>';
+        thead.innerHTML = html;
+    }
+
+    function renderizarCardValores(data) {
+        const extras = data.extras || {};
+        sensores
+            .filter(s => s.habilitado && s.tipo !== 'bomba')
+            .forEach(s => {
+                const el = $('val-' + s.tipo);
+                if (!el) return;
+
+                const valorRaw = s.campo.startsWith('extras.')
+                    ? getCampo(extras, s.campo.substring(7))
+                    : getCampo(data, s.campo);
+
+                el.innerText = formatearValor(valorRaw, s);
+
+                if (s.tipo === 'suelo') {
+                    const bar = $('bar-' + s.tipo);
+                    if (bar) {
+                        const num = Number(valorRaw);
+                        bar.style.width = `${isNaN(num) ? 0 : Math.max(0, Math.min(100, num))}%`;
+                        bar.className = (num <= 40)
+                            ? 'progress-bar bg-danger progress-bar-striped progress-bar-animated'
+                            : 'progress-bar bg-success progress-bar-striped progress-bar-animated';
+                    }
+                }
+            });
+    }
+
+    async function obtenerEstadoManual() {
+        try {
+            const res = await safeFetch(`${CONFIG.API_URL}/v1/bomba/estado?usuarioId=${usuarioId}`);
+            if (!res.ok) throw new Error('No se pudo obtener el estado del dispositivo');
+            const data = await res.json();
+
+            dispositivoOnline = !!data.online;
+            bombaManual = !!data.bombaManual;
+
+            const sensorTanque = sensores.find(s => s.tipo === 'tanque');
+            const tanqueHabilitado = sensorTanque && sensorTanque.habilitado;
+            tanqueBajo = tanqueHabilitado && (data.tanqueEstado === 0 || data.tanqueEstado === '0');
+
+            if (dispositivoOnline) {
+                const banner = $('esp32-offline-banner');
+                if (banner) banner.classList.add('d-none');
+                actualizarBotonManual();
+            } else {
+                renderizarDispositivoOffline();
+            }
+        } catch (err) {
+            console.error(err);
+            dispositivoOnline = false;
+            renderizarDispositivoOffline();
+        }
+    }
+
+    async function cambiarBombaManual() {
+        if (!dispositivoOnline) {
+            mostrarNotificacion('El dispositivo está desconectado. Verifica su alimentación y conexión.', 'danger');
+            return;
+        }
+        if (tanqueBajo) {
+            mostrarNotificacion('Nivel de agua bajo. Rellena el tanque antes de activar la bomba.', 'warning');
+            return;
+        }
+        try {
+            const endpoint = bombaManual ? '/bomba/manual/apagar' : '/bomba/manual/encender';
+            const res = await safeFetch(`${CONFIG.API_URL}/v1${endpoint}`, { method: 'POST' });
+            if (!res.ok) throw new Error('No se pudo cambiar el estado');
+            const data = await res.json();
+            bombaManual = !!data.bombaManual;
+            actualizarBotonManual();
+            obtenerEstado();
+            obtenerLecturasHistoricas();
+        } catch (err) {
+            console.error(err);
+            mostrarNotificacion('No se pudo controlar la bomba en este momento.', 'danger');
+        }
+    }
+
+    function actualizarBotonManual() {
+        const boton = $('btnBombaManual');
+        const estado = $('estadoManual');
+        if (!boton || !estado) return;
+
+        if (tanqueBajo) {
+            boton.disabled = true;
+            boton.innerHTML = '<i class="bi bi-exclamation-triangle me-1"></i> TANQUE BAJO';
+            boton.classList.remove('btn-success', 'btn-danger', 'btn-secondary');
+            boton.classList.add('btn-warning');
+            estado.textContent = 'Estado: Bloqueado (tanque bajo)';
+            return;
         }
 
-        loginForm.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            hideAlert('alert');
-            const username = $('username').value.trim();
-            const password = $('password').value;
-            const btn = $('btnLogin');
-            const btnText = $('btnLoginText');
-            const spinner = $('spinner');
+        boton.disabled = false;
+        boton.classList.remove('btn-warning');
 
-            if (username.length < 4) return showAlert('alert', 'Usuario inválido.', 'warning');
-            if (password.length < 8) return showAlert('alert', 'Contraseña inválida.', 'warning');
+        if (bombaManual) {
+            estado.textContent = 'Estado: ENCENDIDA';
+            boton.innerHTML = '<i class="bi bi-power me-1"></i> APAGAR BOMBA';
+            boton.classList.remove('btn-success', 'btn-secondary');
+            boton.classList.add('btn-danger');
+        } else {
+            estado.textContent = 'Estado: APAGADA';
+            boton.innerHTML = '<i class="bi bi-power me-1"></i> ENCENDER BOMBA';
+            boton.classList.remove('btn-danger', 'btn-secondary');
+            boton.classList.add('btn-success');
+        }
+    }
 
-            btn.disabled = true;
-            spinner.classList.remove('d-none');
-            btnText.textContent = 'Verificando...';
+    function renderizarDispositivoOffline() {
+        const banner = $('esp32-offline-banner');
+        if (banner) banner.classList.remove('d-none');
 
-            try {
-                const res = await fetch(`${CONFIG.API_URL}/auth/login`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, password })
+        sensores.filter(s => s.habilitado && s.tipo !== 'bomba').forEach(s => {
+            const el = $('val-' + s.tipo);
+            if (el) el.innerText = '---';
+            const bar = $('bar-' + s.tipo);
+            if (bar) bar.style.width = '0%';
+        });
+
+        if ($('fecha-val')) $('fecha-val').innerText = '---';
+
+        const badge = $('bomba-status');
+        if (badge) {
+            badge.className = 'badge rounded-pill bg-danger px-4 py-2 fs-5';
+            badge.innerHTML = '<i class="bi bi-wifi-off me-1"></i> SIN CONEXIÓN';
+        }
+        if ($('bomba-texto')) {
+            $('bomba-texto').innerText = 'Dispositivo sin conexión a internet.';
+        }
+
+        const boton = $('btnBombaManual');
+        const estado = $('estadoManual');
+        if (boton) {
+            boton.disabled = true;
+            boton.innerHTML = '<i class="bi bi-wifi-off me-1"></i> SIN CONEXIÓN';
+            boton.classList.remove('btn-success', 'btn-danger', 'btn-warning');
+            boton.classList.add('btn-secondary');
+        }
+        if (estado) estado.textContent = 'Estado: Sin conexión';
+    }
+
+    async function obtenerEstado() {
+        if (!dispositivoOnline) return;
+        try {
+            const res = await safeFetch(`${CONFIG.API_URL}/v1/lecturas/estado/${usuarioId}`);
+            const data = res.ok ? await res.json() : null;
+
+            if (!data || data.mensaje) {
+                sensores.filter(s => s.habilitado && s.tipo !== 'bomba').forEach(s => {
+                    const el = $('val-' + s.tipo);
+                    if (el) el.innerText = '---';
                 });
-                const data = await res.json().catch(() => ({}));
+                return;
+            }
 
-                if (!res.ok || !data.token) throw new Error(data.mensaje || 'Credenciales inválidas.');
-                if (data.rol !== 'ADMIN' && data.rol !== 'PERSONAL') {
-                    throw new Error('Esta cuenta no tiene permisos de administración.');
-                }
+            renderizarCardValores(data);
 
-                localStorage.setItem('adminToken', data.token);
-                localStorage.setItem('adminUsername', data.username);
-                localStorage.setItem('adminRol', data.rol);
-                localStorage.setItem('adminLastActivity', Date.now().toString());
-                window.location.replace('dashboard.html');
-            } catch (err) {
-                showAlert('alert', err.message || 'Error al iniciar sesión.', 'danger');
-                btn.disabled = false;
-                spinner.classList.add('d-none');
-                btnText.textContent = 'Acceder al panel';
+            const badge = $('bomba-status');
+            const texto = $('bomba-texto');
+            if (data.bombaActiva) {
+                badge.className = 'badge rounded-pill bg-success px-4 py-2 fs-5';
+                badge.innerHTML = '<i class="bi bi-water me-1"></i> ENCENDIDA';
+                texto.innerText = 'Bomba activada.';
+            } else {
+                badge.className = 'badge rounded-pill bg-secondary px-4 py-2 fs-5';
+                badge.innerHTML = '<i class="bi bi-power me-1"></i> APAGADA';
+                texto.innerText = 'Sistema en espera.';
+            }
+
+            if (data.fechaRegistro) {
+                $('fecha-val').innerText = new Date(data.fechaRegistro).toLocaleString('es-PE');
+            }
+        } catch (err) {
+            console.error(err);
+        }
+    }
+
+    async function obtenerLecturasHistoricas() {
+        try {
+            const res = await safeFetch(
+                `${CONFIG.API_URL}/v1/lecturas/usuario/${usuarioId}?page=0&size=1000&sort=fechaRegistro,desc`
+            );
+            if (!res.ok) throw new Error('No se pudieron obtener las lecturas');
+
+            const page = await res.json();
+            todasLasLecturas = Array.isArray(page) ? page : (page.content || []);
+
+            aplicarFiltroYRenderizar();
+        } catch (err) {
+            console.error('Error cargando historial:', err);
+        }
+    }
+
+    function aplicarFiltroYRenderizar() {
+        const ahora = new Date();
+        const lecturasFiltradas = todasLasLecturas.filter(l => {
+            if (!l.fechaRegistro) return false;
+            const fechaLectura = new Date(l.fechaRegistro);
+            const diffDias = (ahora - fechaLectura) / (1000 * 60 * 60 * 24);
+
+            if (filtroActual === 'dia') {
+                return fechaLectura.getFullYear() === ahora.getFullYear() &&
+                    fechaLectura.getMonth() === ahora.getMonth() &&
+                    fechaLectura.getDate() === ahora.getDate();
+            } else if (filtroActual === 'semana') {
+                return diffDias <= 7;
+            } else if (filtroActual === 'quincenal') {
+                return diffDias <= 15;
+            } else if (filtroActual === 'mensual') {
+                return diffDias <= 30;
+            }
+            return true;
+        });
+
+        lecturasFiltradas.sort((a, b) => new Date(a.fechaRegistro) - new Date(b.fechaRegistro));
+
+        actualizarGrafico(lecturasFiltradas);
+        actualizarTabla(lecturasFiltradas);
+    }
+
+    function actualizarGrafico(lecturas) {
+        const etiquetas = lecturas.map(l => {
+            const f = new Date(l.fechaRegistro);
+            return filtroActual === 'dia'
+                ? f.toLocaleTimeString('es-PE', { hour: '2-digit', minute: '2-digit' })
+                : f.toLocaleDateString('es-PE', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        });
+
+        const datasets = [];
+        const colores = { success: '#198754', danger: '#dc3545', info: '#0dcaf0', primary: '#0d6efd', warning: '#ffc107' };
+
+        sensores
+            .filter(s => s.habilitado && s.tipoValor === 'numero' && s.tipo !== 'bomba')
+            .forEach(s => {
+                const valores = lecturas.map(l => {
+                    const raw = s.campo.startsWith('extras.')
+                        ? getCampo(l.extras || {}, s.campo.substring(7))
+                        : getCampo(l, s.campo);
+                    const num = Number(raw);
+                    return isNaN(num) ? null : num;
+                });
+                const color = colores[s.color] || '#6c757d';
+                datasets.push({
+                    label: `${s.label}${s.unidad ? ' (' + s.unidad + ')' : ''}`,
+                    data: valores,
+                    tension: 0.3,
+                    borderColor: color,
+                    backgroundColor: color + '20',
+                    borderWidth: 2,
+                    pointRadius: 3
+                });
+            });
+
+        const ctx = $('humedadChart');
+        if (!ctx) return;
+        if (humedadChart) humedadChart.destroy();
+
+        humedadChart = new Chart(ctx, {
+            type: 'line',
+            data: { labels: etiquetas, datasets },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: { intersect: false, mode: 'index' },
+                scales: {
+                    y: { beginAtZero: true, title: { display: true, text: 'Valores' } },
+                    x: { title: { display: true, text: 'Tiempo' } }
+                },
+                plugins: { legend: { display: true } }
             }
         });
-        return;
     }
 
-    if (!verificarSesionActiva()) return;
+    function actualizarTabla(lecturas) {
+        const tabla = $('tablaLecturas');
+        if (!tabla) return;
+        const colSpan = 1 + sensores.filter(s => s.habilitado).length;
+        tabla.innerHTML = '';
 
-    ['click', 'keydown', 'mousemove', 'scroll'].forEach(evt => {
-        document.addEventListener(evt, resetTimer, { passive: true });
+        if (lecturas.length === 0) {
+            tabla.innerHTML = `<tr><td colspan="${colSpan}" class="text-muted">No hay lecturas registradas en este período.</td></tr>`;
+            return;
+        }
+
+        lecturas.slice().reverse().forEach(l => {
+            const fechaHora = new Date(l.fechaRegistro).toLocaleString('es-PE', {
+                year: 'numeric', month: '2-digit', day: '2-digit',
+                hour: '2-digit', minute: '2-digit'
+            });
+
+            let fila = `<td>${fechaHora}</td>`;
+            sensores.filter(s => s.habilitado).forEach(s => {
+                const raw = s.campo.startsWith('extras.')
+                    ? getCampo(l.extras || {}, s.campo.substring(7))
+                    : getCampo(l, s.campo);
+
+                let txt = formatearValor(raw, s);
+                if (s.tipoValor === 'numero' && s.unidad && raw != null) {
+                    txt += ' ' + s.unidad;
+                }
+                fila += `<td>${txt}</td>`;
+            });
+
+            tabla.innerHTML += `<tr>${fila}</tr>`;
+        });
+    }
+
+    async function registrarPush() {
+        try {
+            if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+
+            const registration = await navigator.serviceWorker.register('/sw.js');
+            const vapidRes = await fetch(`${CONFIG.API_URL}/push/vapid-public-key`);
+            if (!vapidRes.ok) return;
+            const vapidData = await vapidRes.json();
+            if (!vapidData.publicKey) return;
+            const applicationServerKey = urlBase64ToUint8Array(vapidData.publicKey);
+
+            const subscription = await registration.pushManager.subscribe({
+                userVisibleOnly: true,
+                applicationServerKey
+            });
+
+            const currentToken = localStorage.getItem('token');
+            const headers = { 'Content-Type': 'application/json' };
+            if (currentToken) {
+                headers['Authorization'] = `Bearer ${currentToken}`;
+            }
+
+            await fetch(`${CONFIG.API_URL}/push/subscribe`, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(subscription)
+            });
+        } catch (err) {
+            console.warn('Push no disponible:', err);
+        }
+    }
+
+    function urlBase64ToUint8Array(base64String) {
+        const padding = '='.repeat((4 - base64String.length % 4) % 4);
+        const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+        const rawData = window.atob(base64);
+        const outputArray = new Uint8Array(rawData.length);
+        for (let i = 0; i < rawData.length; ++i) {
+            outputArray[i] = rawData.charCodeAt(i);
+        }
+        return outputArray;
+    }
+
+    registrarPush();
+
+    document.querySelectorAll('.btn-group button').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            document.querySelectorAll('.btn-group button').forEach(b => b.classList.remove('active', 'btn-success'));
+            document.querySelectorAll('.btn-group button').forEach(b => b.classList.add('btn-outline-success'));
+
+            e.target.classList.add('active', 'btn-success');
+            e.target.classList.remove('btn-outline-success');
+
+            filtroActual = e.target.getAttribute('data-filtro');
+            aplicarFiltroYRenderizar();
+        });
     });
 
-    if ($('adminActual')) $('adminActual').textContent = localStorage.getItem('adminUsername') || 'admin';
-    if ($('adminRolBadge')) {
-        $('adminRolBadge').textContent = esAdmin() ? 'JEFE' : 'PERSONAL';
-        $('adminRolBadge').className = esAdmin() ? 'badge bg-danger ms-1' : 'badge bg-info text-dark ms-1';
+    const btnBombaManual = $('btnBombaManual');
+    if (btnBombaManual) {
+        btnBombaManual.addEventListener('click', cambiarBombaManual);
     }
 
-    if (esAdmin() && $('tab-personal-item')) {
-        $('tab-personal-item').style.display = 'block';
-    }
+    cargarConfiguracion().then(() => {
+        obtenerEstadoManual();
+        obtenerEstado();
+        obtenerLecturasHistoricas();
+    });
 
-    if ($('btnLogout')) {
-        $('btnLogout').addEventListener('click', () => {
-            if (!logoutConfirmado) {
-                logoutConfirmado = true;
-                notify('Pulsa Salir nuevamente para confirmar el cierre de sesión.', 'warning');
-                setTimeout(() => { logoutConfirmado = false; }, 4000);
-                return;
-            }
-            cerrarSesion();
-        });
-    }
+    setInterval(obtenerEstadoManual, CONFIG.POLL_ESTADO_MS);
+    setInterval(obtenerEstado, CONFIG.POLL_ESTADO_MS);
+    setInterval(obtenerLecturasHistoricas, CONFIG.POLL_LECTURAS_MS);
 
-    const registerForm = $('registerClientForm');
-    if (registerForm) {
-        registerForm.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            hideAlert('registerAlert');
-            $('registerResult').classList.add('d-none');
-
-            const nombres = $('nombres').value.trim();
-            const apellidos = $('apellidos').value.trim();
-            const correoPersonal = $('correoPersonal').value.trim();
-            const telefono = $('telefono').value.trim();
-            const password = $('password').value;
-            const descripcionServicio = $('descripcionServicio').value.trim();
-            const costoSistema = parseFloat($('costoSistema').value) || 120;
-            const costoSensores = parseFloat($('costoSensores').value) || 20;
-            const costoComponentes = parseFloat($('costoComponentes').value) || 50;
-            const costoMensual = parseFloat($('costoMensual').value) || 20;
-
-            if (!nombres || !apellidos) return showAlert('registerAlert', 'Nombres y apellidos son obligatorios.', 'warning');
-            if (!/^[a-zA-Z0-9._%+-]+@gmail\.com$/.test(correoPersonal)) return showAlert('registerAlert', 'Correo debe ser @gmail.com', 'warning');
-            if (password.length < 8) return showAlert('registerAlert', 'Contraseña mínima 8 caracteres.', 'warning');
-
-            const btn = $('btnRegister');
-            const spinner = $('registerSpinner');
-            btn.disabled = true;
-            spinner.classList.remove('d-none');
-
-            try {
-                const res = await apiFetch('/admin/clientes', {
-                    method: 'POST',
-                    body: JSON.stringify({
-                        nombres, apellidos, correoPersonal, telefono, password,
-                        descripcionServicio, costoSistema, costoSensores, costoComponentes, costoMensual
-                    })
-                });
-                const data = await res.json().catch(() => ({}));
-                if (!res.ok) throw new Error(data.mensaje || 'No se pudo registrar.');
-
-                $('registerResult').className = 'alert alert-success mt-4';
-                $('registerResult').classList.remove('d-none');
-                $('registerResult').innerHTML = `
-                    <h5 class="fw-bold mb-2"><i class="bi bi-check-circle me-1"></i>Cliente registrado</h5>
-                    <p class="mb-1"><strong>Usuario:</strong> ${escapeHtml(data.username)}</p>
-                    <p class="mb-1"><strong>Email:</strong> ${escapeHtml(data.email)}</p>
-                    <p class="mb-1"><strong>UUID Dispositivo:</strong> <code>${escapeHtml(data.dispositivoId)}</code></p>
-                    <p class="mb-1"><strong>Estado:</strong> ${escapeHtml(data.estado)}</p>
-                    <p class="mb-0 small text-muted">Copia el UUID para flashear el ESP32.</p>
-                `;
-                registerForm.reset();
-                $('password').value = '123456789';
-                $('costoSistema').value = '120';
-                $('costoSensores').value = '20';
-                $('costoComponentes').value = '50';
-                $('costoMensual').value = '20';
-                notify('Cliente registrado correctamente.', 'success');
-                cargarClientes();
-            } catch (err) {
-                showAlert('registerAlert', err.message || 'Error al registrar.', 'danger');
-            } finally {
-                btn.disabled = false;
-                spinner.classList.add('d-none');
-            }
-        });
-    }
-
-    async function cargarClientes() {
-        const tabla = $('clientesTable');
-        if (!tabla) return;
-        tabla.innerHTML = '<tr><td colspan="8" class="text-center text-muted">Cargando...</td></tr>';
-
-        try {
-            const res = await apiFetch('/admin/clientes');
-            if (!res.ok) throw new Error('No se pudieron cargar los clientes');
-            const clientes = await res.json();
-            clientesCache = Array.isArray(clientes) ? clientes : [];
-
-            if ($('badgeTotal')) $('badgeTotal').textContent = clientesCache.length;
-
-            if (clientesCache.length === 0) {
-                tabla.innerHTML = '<tr><td colspan="8" class="text-center text-muted">Sin clientes registrados.</td></tr>';
-                return;
-            }
-
-            tabla.innerHTML = '';
-            clientesCache.forEach(c => {
-                const safeId = Number(c.id);
-                let estadoBadge, botones;
-
-                if (esAdmin()) {
-                    switch (c.estado) {
-                        case 'ACTIVO':
-                            estadoBadge = '<span class="badge bg-success">ACTIVO</span>';
-                            botones = `
-                                <button class="btn btn-sm btn-outline-primary" onclick="window.__editarCliente(${safeId})" title="Editar"><i class="bi bi-pencil"></i></button>
-                                <button class="btn btn-sm btn-outline-info" onclick="window.__verPrecios(${safeId})" title="Precios"><i class="bi bi-currency-dollar"></i></button>
-                                <button class="btn btn-sm btn-outline-warning" onclick="window.__suspenderCliente(${safeId})" title="Suspender"><i class="bi bi-pause-circle"></i></button>
-                                <button class="btn btn-sm btn-outline-danger" onclick="window.__eliminarCliente(${safeId})" title="Eliminar"><i class="bi bi-trash"></i></button>`;
-                            break;
-                        case 'SUSPENDIDO':
-                            estadoBadge = '<span class="badge bg-danger">SUSPENDIDO</span>';
-                            botones = `
-                                <button class="btn btn-sm btn-outline-primary" onclick="window.__editarCliente(${safeId})" title="Editar"><i class="bi bi-pencil"></i></button>
-                                <button class="btn btn-sm btn-outline-info" onclick="window.__verPrecios(${safeId})" title="Precios"><i class="bi bi-currency-dollar"></i></button>
-                                <button class="btn btn-sm btn-outline-success" onclick="window.__reactivarCliente(${safeId})" title="Reactivar"><i class="bi bi-play-circle"></i></button>
-                                <button class="btn btn-sm btn-outline-danger" onclick="window.__eliminarCliente(${safeId})" title="Eliminar"><i class="bi bi-trash"></i></button>`;
-                            break;
-                        default:
-                            estadoBadge = '<span class="badge bg-warning text-dark">PENDIENTE</span>';
-                            botones = `
-                                <button class="btn btn-sm btn-success" onclick="window.__activarCliente(${safeId})" title="Activar"><i class="bi bi-check2-circle"></i> Activar</button>
-                                <button class="btn btn-sm btn-outline-primary" onclick="window.__editarCliente(${safeId})" title="Editar"><i class="bi bi-pencil"></i></button>
-                                <button class="btn btn-sm btn-outline-danger" onclick="window.__eliminarCliente(${safeId})" title="Eliminar"><i class="bi bi-trash"></i></button>`;
-                    }
-                } else {
-                    estadoBadge = c.estado === 'ACTIVO'
-                        ? '<span class="badge bg-success">ACTIVO</span>'
-                        : c.estado === 'SUSPENDIDO'
-                            ? '<span class="badge bg-danger">SUSPENDIDO</span>'
-                            : '<span class="badge bg-warning text-dark">PENDIENTE</span>';
-                    botones = '<span class="text-muted small">Solo lectura</span>';
-                }
-
-                const uuidCorto = c.dispositivoId ? escapeHtml(c.dispositivoId.substring(0, 8) + '...') : '--';
-                const uuidBtn = c.dispositivoId
-                    ? `<button type="button" class="btn btn-sm btn-link p-0 btn-copiar-uuid" data-uuid="${escapeHtml(c.dispositivoId)}" title="${escapeHtml(c.dispositivoId)}"><code>${uuidCorto}</code></button>`
-                    : '--';
-
-                tabla.innerHTML += `
-                    <tr>
-                        <td>${escapeHtml(c.id)}</td>
-                        <td><strong>${escapeHtml(c.nombres)} ${escapeHtml(c.apellidos)}</strong></td>
-                        <td>${escapeHtml(c.usuario?.username || '--')}</td>
-                        <td>${escapeHtml(c.correoPersonal || '--')}</td>
-                        <td>${escapeHtml(c.telefono || '--')}</td>
-                        <td>${uuidBtn}</td>
-                        <td>${estadoBadge}</td>
-                        <td class="text-center">${botones}</td>
-                    </tr>`;
-            });
-
-            tabla.querySelectorAll('.btn-copiar-uuid').forEach(btn => {
-                btn.addEventListener('click', async () => {
-                    const uuid = btn.getAttribute('data-uuid');
-                    if (!uuid) return;
-                    try {
-                        await navigator.clipboard.writeText(uuid);
-                        notify(`UUID copiado: ${uuid}`, 'success');
-                    } catch (_) {
-                        notify(`UUID: ${uuid}`, 'info');
-                    }
-                });
-            });
-        } catch (err) {
-            tabla.innerHTML = `<tr><td colspan="8" class="text-center text-danger">${escapeHtml(err.message)}</td></tr>`;
-        }
-    }
-
-    window.__activarCliente = async function (clienteId) {
-        if (!esAdmin()) return notify('Solo el jefe puede activar clientes.', 'warning');
-        try {
-            const res = await apiFetch(`/admin/clientes/${clienteId}/activar`, { method: 'POST' });
-            const data = await res.json().catch(() => ({}));
-            if (!res.ok) {
-                if (data.emailFallido) {
-                    notify(`Cliente activado, pero el correo a ${data.emailFallido} falló: ${data.mensaje}`, 'warning');
-                } else {
-                    throw new Error(data.mensaje || 'No se pudo activar');
-                }
+    const btnConfigWifi = $('btnConfigWifi');
+    if (btnConfigWifi) {
+        btnConfigWifi.addEventListener('click', () => {
+            const modalEl = $('wifiGuiaModal');
+            if (modalEl && window.bootstrap && bootstrap.Modal) {
+                bootstrap.Modal.getOrCreateInstance(modalEl).show();
             } else {
-                notify(`Cliente activado (${data.username}) y credenciales enviadas a ${data.emailEnviado}.`, 'success');
-            }
-            await cargarClientes();
-        } catch (err) {
-            notify(`Error: ${err.message}`, 'danger');
-            await cargarClientes();
-        }
-    };
-
-    window.__editarCliente = async function (clienteId) {
-        if (!esAdmin()) return notify('Solo el jefe puede editar clientes.', 'warning');
-        try {
-            let c = clientesCache.find(x => x.id === clienteId);
-            if (!c) {
-                const res = await apiFetch('/admin/clientes');
-                const clientes = await res.json();
-                clientesCache = Array.isArray(clientes) ? clientes : [];
-                c = clientesCache.find(x => x.id === clienteId);
-            }
-            if (!c) return;
-            $('editClienteId').value = c.id;
-            $('editNombres').value = c.nombres;
-            $('editApellidos').value = c.apellidos;
-            $('editCorreoPersonal').value = c.correoPersonal || '';
-            $('editTelefono').value = c.telefono || '';
-            new bootstrap.Modal($('editClienteModal')).show();
-        } catch (err) {
-            notify(err.message, 'danger');
-        }
-    };
-
-    if ($('btnSaveEdit')) {
-        $('btnSaveEdit').addEventListener('click', async () => {
-            const id = $('editClienteId').value;
-            const body = {
-                nombres: $('editNombres').value.trim(),
-                apellidos: $('editApellidos').value.trim(),
-                correoPersonal: $('editCorreoPersonal').value.trim(),
-                telefono: $('editTelefono').value.trim()
-            };
-            if (!body.nombres || !body.apellidos || !body.correoPersonal) {
-                return notify('Campos obligatorios incompletos.', 'warning');
-            }
-            if (!/^[a-zA-Z0-9._%+-]+@gmail\.com$/.test(body.correoPersonal)) {
-                return notify('El correo debe ser @gmail.com.', 'warning');
-            }
-            try {
-                const res = await apiFetch(`/admin/clientes/${id}`, { method: 'PUT', body: JSON.stringify(body) });
-                const data = await res.json().catch(() => ({}));
-                if (!res.ok) throw new Error(data.mensaje || 'Error');
-                bootstrap.Modal.getInstance($('editClienteModal')).hide();
-                notify('Cliente actualizado correctamente.', 'success');
-                cargarClientes();
-            } catch (err) {
-                notify(err.message, 'danger');
+                mostrarNotificacion('Abre el panel de configuración de red del equipo para actualizar el WiFi.', 'info');
             }
         });
     }
-
-    window.__eliminarCliente = async function (clienteId) {
-        if (!esAdmin()) return notify('Solo el jefe puede eliminar clientes.', 'warning');
-        try {
-            const res = await apiFetch(`/admin/clientes/${clienteId}`, { method: 'DELETE' });
-            const data = await res.json().catch(() => ({}));
-            if (!res.ok) throw new Error(data.mensaje || 'Error al eliminar');
-            notify('Cliente eliminado correctamente.', 'success');
-            cargarClientes();
-        } catch (err) {
-            notify(err.message, 'danger');
-        }
-    };
-
-    window.__suspenderCliente = async function (clienteId) {
-        if (!esAdmin()) return notify('Solo el jefe puede suspender clientes.', 'warning');
-        try {
-            const res = await apiFetch(`/admin/clientes/${clienteId}/suspender`, { method: 'POST' });
-            const data = await res.json().catch(() => ({}));
-            if (!res.ok) throw new Error(data.mensaje || 'Error');
-            notify('Servicio suspendido.', 'success');
-            cargarClientes();
-        } catch (err) {
-            notify(err.message, 'danger');
-        }
-    };
-
-    window.__reactivarCliente = async function (clienteId) {
-        if (!esAdmin()) return notify('Solo el jefe puede reactivar clientes.', 'warning');
-        try {
-            const res = await apiFetch(`/admin/clientes/${clienteId}/reactivar`, { method: 'POST' });
-            const data = await res.json().catch(() => ({}));
-            if (!res.ok) throw new Error(data.mensaje || 'Error');
-            notify('Servicio reactivado.', 'success');
-            cargarClientes();
-        } catch (err) {
-            notify(err.message, 'danger');
-        }
-    };
-
-    window.__verPrecios = async function (clienteId) {
-        if (!esAdmin()) return notify('Solo el jefe puede ver precios.', 'warning');
-        try {
-            let c = clientesCache.find(x => x.id === clienteId);
-            if (!c) {
-                const res = await apiFetch('/admin/clientes');
-                const clientes = await res.json();
-                clientesCache = Array.isArray(clientes) ? clientes : [];
-                c = clientesCache.find(x => x.id === clienteId);
-            }
-            if (!c) return;
-
-            $('preciosClienteId').value = c.id;
-            $('precioSistema').value = c.costoSistema ?? 120;
-            $('precioSensores').value = c.costoSensores ?? 20;
-            $('precioComponentes').value = c.costoComponentes ?? 50;
-            $('precioMensual').value = c.costoMensual ?? 20;
-            $('precioDiasGracia').value = c.diasGracia ?? 5;
-            $('precioDescripcion').value = c.descripcionServicio || '';
-            $('precioFechaPago').textContent = c.fechaProximoPago
-                ? new Date(c.fechaProximoPago).toLocaleString('es-PE')
-                : 'Sin registrar';
-
-            new bootstrap.Modal($('preciosModal')).show();
-        } catch (err) {
-            notify(err.message, 'danger');
-        }
-    };
-
-    if ($('btnSavePrecios')) {
-        $('btnSavePrecios').addEventListener('click', async () => {
-            const id = $('preciosClienteId').value;
-            const body = {
-                costoSistema: parseFloat($('precioSistema').value) || 0,
-                costoSensores: parseFloat($('precioSensores').value) || 0,
-                costoComponentes: parseFloat($('precioComponentes').value) || 0,
-                costoMensual: parseFloat($('precioMensual').value) || 0,
-                diasGracia: parseInt($('precioDiasGracia').value) || 5,
-                descripcionServicio: $('precioDescripcion').value.trim()
-            };
-            try {
-                const res = await apiFetch(`/admin/clientes/${id}/precios`, {
-                    method: 'PUT',
-                    body: JSON.stringify(body)
-                });
-                const data = await res.json().catch(() => ({}));
-                if (!res.ok) throw new Error(data.mensaje || 'Error');
-                bootstrap.Modal.getInstance($('preciosModal')).hide();
-                notify('Precios actualizados.', 'success');
-                cargarClientes();
-            } catch (err) {
-                notify(err.message, 'danger');
-            }
-        });
-    }
-
-    if ($('btnRegistrarPago')) {
-        $('btnRegistrarPago').addEventListener('click', async () => {
-            const id = $('preciosClienteId').value;
-            try {
-                const res = await apiFetch(`/admin/clientes/${id}/pago?meses=1`, { method: 'POST' });
-                const data = await res.json().catch(() => ({}));
-                if (!res.ok) throw new Error(data.mensaje || 'Error');
-                bootstrap.Modal.getInstance($('preciosModal')).hide();
-                notify(`Pago registrado. Próximo pago: ${new Date(data.fechaProximoPago).toLocaleString('es-PE')}`, 'success');
-                cargarClientes();
-            } catch (err) {
-                notify(err.message, 'danger');
-            }
-        });
-    }
-
-    async function cargarPersonal() {
-        const tabla = $('personalTable');
-        if (!tabla) return;
-        tabla.innerHTML = '<tr><td colspan="4" class="text-center text-muted">Cargando...</td></tr>';
-        try {
-            const res = await apiFetch('/admin/personal');
-            if (!res.ok) throw new Error('No se pudo cargar');
-            const lista = await res.json();
-            if (lista.length === 0) {
-                tabla.innerHTML = '<tr><td colspan="4" class="text-center text-muted">Sin personal registrado.</td></tr>';
-                return;
-            }
-            tabla.innerHTML = '';
-            lista.forEach(p => {
-                const rolBadge = p.rol === 'ADMIN'
-                    ? '<span class="badge bg-danger">JEFE</span>'
-                    : '<span class="badge bg-info text-dark">PERSONAL</span>';
-                tabla.innerHTML += `<tr>
-                    <td>${escapeHtml(p.id)}</td>
-                    <td><strong>${escapeHtml(p.username)}</strong></td>
-                    <td>${escapeHtml(p.email)}</td>
-                    <td>${rolBadge}</td>
-                </tr>`;
-            });
-        } catch (err) {
-            tabla.innerHTML = `<tr><td colspan="4" class="text-center text-danger">${escapeHtml(err.message)}</td></tr>`;
-        }
-    }
-
-    const createPersonalForm = $('createPersonalForm');
-    if (createPersonalForm) {
-        createPersonalForm.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            hideAlert('personalAlert');
-            const username = $('personalUsername').value.trim();
-            const email = $('personalEmail').value.trim();
-            const password = $('personalPassword').value;
-
-            if (username.length < 4) return showAlert('personalAlert', 'Usuario mínimo 4 caracteres.', 'warning');
-            if (!/^[a-zA-Z0-9._%+-]+@gmail\.com$/.test(email)) return showAlert('personalAlert', 'Email debe ser @gmail.com', 'warning');
-            if (password.length < 8) return showAlert('personalAlert', 'Contraseña mínimo 8 caracteres.', 'warning');
-
-            try {
-                const res = await apiFetch('/admin/personal', {
-                    method: 'POST',
-                    body: JSON.stringify({ username, email, password })
-                });
-                const data = await res.json().catch(() => ({}));
-                if (!res.ok) throw new Error(data.mensaje || 'Error');
-                showAlert('personalAlert', `Personal creado: ${data.username} (rol: ${data.rol})`, 'success');
-                createPersonalForm.reset();
-                $('personalPassword').value = 'Admin1234!';
-                cargarPersonal();
-            } catch (err) {
-                showAlert('personalAlert', err.message, 'danger');
-            }
-        });
-    }
-
-    if ($('btnRefresh')) $('btnRefresh').addEventListener('click', cargarClientes);
-    if ($('tab-list-btn')) $('tab-list-btn').addEventListener('click', cargarClientes);
-    if ($('tab-personal-btn')) $('tab-personal-btn').addEventListener('click', cargarPersonal);
-
-    cargarClientes();
-    if (esAdmin()) cargarPersonal();
 })();
